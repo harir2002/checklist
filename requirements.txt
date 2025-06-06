@@ -1,0 +1,9 @@
+streamlit 
+requests 
+pandas 
+python-dotenv 
+aiohttp 
+openpyxl 
+ibm_boto3 
+tenacity 
+python-dateutil
