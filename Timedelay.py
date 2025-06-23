@@ -1,15 +1,9 @@
 
-
-
-
-
-
-
 #!/usr/bin/env python   
 # -*- coding: utf-8 -*-
 import streamlit as st
 import requests
-from Veridia import *
+from veridia1 import *
 import json 
 import urllib.parse
 import urllib3
@@ -34,11 +28,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 from io import BytesIO
 import traceback
-from Veridia import *
+from veridia1 import *
 from datetime import date
 import concurrent.futures
 from dateutil.relativedelta import relativedelta
-
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,7 +59,38 @@ API_KEY = os.getenv("API_KEY_1")
 LOGIN_URL = "https://dms.asite.com/apilogin/"
 IAM_TOKEN_URL = "https://iam.cloud.ibm.com/identity/token"
 
+import time
+from functools import wraps
+import streamlit as st
+
+def function_timer(show_args=False):
+    """Decorator to measure and display function execution time"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Start timer
+            start_time = time.time()
+            
+            # Call the original function
+            result = func(*args, **kwargs)
+            
+            # Calculate duration
+            duration = time.time() - start_time
+            
+            # Display timing info
+            func_name = func.__name__.replace('_', ' ').title()
+            arg_info = ""
+            if show_args and args:
+                arg_info = f" with args: {args[1:]}"  # Skip self if present
+            
+            st.info(f"⏱️ {func_name}{arg_info} executed in {duration:.2f} seconds")
+            
+            return result
+        return wrapper
+    return decorator
+
 # Login Function
+@function_timer()
 async def login_to_asite(email, password):
     headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
     payload = {"emailId": email, "password": password}
@@ -97,6 +121,7 @@ async def login_to_asite(email, password):
         return None
 
 # Function to generate access token
+@function_timer()
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=10, max=60))
 def get_access_token(api_key):
     headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
@@ -117,6 +142,7 @@ def get_access_token(api_key):
         return None
 
 # Initialize COS client
+@function_timer()
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
 def initialize_cos_client():
     try:
@@ -140,32 +166,44 @@ def initialize_cos_client():
         st.error(f"❌ Error initializing COS client: {str(e)}")
         raise
 
-
 async def validate_session():
     url = "https://dmsak.asite.com/api/workspace/workspacelist"
     headers = {'Cookie': f'ASessionID={st.session_state.sessionid}'}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as response:
             if response.status == 200:
+                logger.info("Session validated successfully")
                 return True
             else:
                 logger.error(f"Session validation failed: {response.status} - {await response.text()}")
                 return False
 
 async def refresh_session_if_needed():
-    if not await validate_session():
+    if 'sessionid' not in st.session_state or not st.session_state.sessionid:
+        logger.warning("No session ID found in session state, attempting login")
         new_session_id = await login_to_asite(os.getenv("ASITE_EMAIL"), os.getenv("ASITE_PASSWORD"))
         if new_session_id:
             st.session_state.sessionid = new_session_id
             return new_session_id
         else:
+            raise Exception("Failed to establish initial session")
+
+    if not await validate_session():
+        logger.info("Session invalid, attempting to refresh")
+        new_session_id = await login_to_asite(os.getenv("ASITE_EMAIL"), os.getenv("ASITE_PASSWORD"))
+        if new_session_id:
+            st.session_state.sessionid = new_session_id
+            logger.info(f"Session refreshed successfully, new Session ID: {new_session_id}")
+            return new_session_id
+        else:
             raise Exception("Failed to refresh session")
+    logger.info("Session is valid, no refresh needed")
     return st.session_state.sessionid
 
-
-
 # Fetch Workspace ID
+@function_timer()
 async def GetWorkspaceID():
+    await refresh_session_if_needed()
     url = "https://dmsak.asite.com/api/workspace/workspacelist"
     headers = {
         'Cookie': f'ASessionID={st.session_state.sessionid}',
@@ -176,9 +214,10 @@ async def GetWorkspaceID():
     st.session_state.workspaceid = response.json()['asiteDataList']['workspaceVO'][4]['Workspace_Id']
     st.write(f"Workspace ID: {st.session_state.workspaceid}")
 
-
 # Fetch Project IDs
+@function_timer()
 async def GetProjectId():
+    await refresh_session_if_needed()
     url = f"https://adoddleak.asite.com/commonapi/qaplan/getQualityPlanList;searchCriteria={{'criteria': [{{'field': 'planCreationDate','operator': 6,'values': ['11-Mar-2025']}}], 'projectId': {str(st.session_state.workspaceid)}, 'recordLimit': 1000, 'recordStart': 1}}"
     headers = {
         'Cookie': f'ASessionID={st.session_state.sessionid}',
@@ -189,7 +228,7 @@ async def GetProjectId():
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         data = response.json()
-        logger.info(f"GetProjectId response: {json.dumps(data, indent=2)}")  # Log full response
+        logger.info(f"GetProjectId response: {json.dumps(data, indent=2)}")
         if 'data' not in data or not data['data']:
             st.error("❌ No project data found in GetProjectId response")
             logger.error("No project data found in GetProjectId response")
@@ -208,27 +247,48 @@ async def GetProjectId():
     except Exception as e:
         st.error(f"❌ Error fetching Project IDs: {str(e)}")
         logger.error(f"Error fetching Project IDs: {str(e)}")
-        
-# Asynchronous Fetch Function
+
+# Asynchronous Fetch Function with Retry Logic
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 async def fetch_data(session, url, headers, email=None, password=None):
-    # Optionally use email and password for authentication if needed
-    async with session.get(url, headers=headers) as response:
-        if response.status == 200:
-            return await response.json()
-        elif response.status == 204:
-            return None
-        else:
-            raise Exception(f"Error fetching data: {response.status} - {await response.text()}")
-        
+    try:
+        logger.info(f"Fetching data from URL: {url}")
+        async with session.get(url, headers=headers) as response:
+            content_type = response.headers.get('Content-Type', '')
+            logger.info(f"Response Content-Type: {content_type}")
+            if response.status == 200:
+                if 'application/json' in content_type:
+                    return await response.json()
+                else:
+                    text = await response.text()
+                    logger.error(f"Unexpected Content-Type: {content_type}, Response: {text[:500]}")
+                    raise ValueError(f"Unexpected Content-Type: {content_type}, expected application/json")
+            elif response.status == 204:
+                logger.info("No content returned (204)")
+                return None
+            else:
+                text = await response.text()
+                logger.error(f"Error fetching data: {response.status} - {text[:500]}")
+                if response.status == 401:
+                    raise Exception("Unauthorized: Session may have expired")
+                raise Exception(f"Error fetching data: {response.status} - {text[:500]}")
+    except Exception as e:
+        logger.error(f"Fetch failed: {str(e)}")
+        raise
+
 # Fetch All Data with Async
+@function_timer()
 async def GetAllDatas():
     record_limit = 1000
-    headers = {'Cookie': f'ASessionID={st.session_state.sessionid}'}
     all_finishing_data = []
     all_structure_data = []
     all_external_data = []
     all_lift_data = []
     all_common_area_finishing = []
+
+    # Ensure session is valid before starting
+    await refresh_session_if_needed()
+    headers = {'Cookie': f'ASessionID={st.session_state.sessionid}'}
 
     async with aiohttp.ClientSession() as session:
         # Fetch Veridia Finishing data
@@ -237,6 +297,9 @@ async def GetAllDatas():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanAssociation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_finishing}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                # Refresh session before each major fetch to ensure validity
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Finishing data available (204)")
@@ -249,8 +312,10 @@ async def GetAllDatas():
                 if len(all_finishing_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Finishing data: {str(e)}")
+                logger.error(f"Finishing data fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia Structure data
@@ -259,6 +324,8 @@ async def GetAllDatas():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanAssociation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_structure}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Structure data available (204)")
@@ -271,8 +338,10 @@ async def GetAllDatas():
                 if len(all_structure_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Structure data: {str(e)}")
+                logger.error(f"Structure data fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia External Development data
@@ -281,6 +350,8 @@ async def GetAllDatas():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanAssociation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_external_development}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more External Development data available (204)")
@@ -293,8 +364,10 @@ async def GetAllDatas():
                 if len(all_external_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching External Development data: {str(e)}")
+                logger.error(f"External Development data fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia Lift data
@@ -303,6 +376,8 @@ async def GetAllDatas():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanAssociation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_lift}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Lift data available (204)")
@@ -315,8 +390,10 @@ async def GetAllDatas():
                 if len(all_lift_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Lift data: {str(e)}")
+                logger.error(f"Lift data fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia Common Area Finishing data
@@ -325,6 +402,8 @@ async def GetAllDatas():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanAssociation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_Common_Area_Finishing}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Common Area Finishing data available (204)")
@@ -337,8 +416,10 @@ async def GetAllDatas():
                 if len(all_common_area_finishing[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Common Area Finishing data: {str(e)}")
+                logger.error(f"Common Area Finishing data fetch failed: {str(e)}")
                 break
 
     df_finishing = pd.DataFrame(all_finishing_data)
@@ -386,7 +467,9 @@ async def GetAllDatas():
 
     return veridia_finishing, veridia_structure, veridia_external, veridia_lift, veridia_common_area
 
+
 # Fetch Activity Data with Async
+@function_timer()
 async def Get_Activity():
     record_limit = 1000
     headers = {
@@ -400,6 +483,9 @@ async def Get_Activity():
     all_lift_activity_data = []
     all_common_area_activity_data = []
 
+    # Ensure session is valid before starting
+    await refresh_session_if_needed()
+
     async with aiohttp.ClientSession() as session:
         # Fetch Veridia Finishing Activity data
         start_record = 1
@@ -407,6 +493,8 @@ async def Get_Activity():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanActivities/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_finishing}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Finishing Activity data available (204)")
@@ -419,8 +507,10 @@ async def Get_Activity():
                 if len(all_finishing_activity_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Finishing Activity data: {str(e)}")
+                logger.error(f"Finishing Activity fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia Structure Activity data
@@ -429,6 +519,8 @@ async def Get_Activity():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanActivities/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_structure}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Structure Activity data available (204)")
@@ -441,8 +533,10 @@ async def Get_Activity():
                 if len(all_structure_activity_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Structure Activity data: {str(e)}")
+                logger.error(f"Structure Activity fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia External Development Activity data
@@ -451,6 +545,8 @@ async def Get_Activity():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanActivities/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_external_development}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more External Development Activity data available (204)")
@@ -463,8 +559,10 @@ async def Get_Activity():
                 if len(all_external_activity_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching External Development Activity data: {str(e)}")
+                logger.error(f"External Development Activity fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia Lift Activity data
@@ -473,6 +571,8 @@ async def Get_Activity():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanActivities/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_lift}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 logger.info(f"Fetching Lift Activity data from URL: {url}")
                 data = await fetch_data(session, url, headers)
                 if data is None:
@@ -492,14 +592,15 @@ async def Get_Activity():
                 logger.error(f"Lift Activity fetch failed: {str(e)}")
                 all_lift_activity_data = []  # Fallback to empty list
                 break
-        
-        
+
         # Fetch Veridia Common Area Finishing Activity data
         start_record = 1
         st.write("Fetching Activity data for Veridia Common Area Finishing...")
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanActivities/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_Common_Area_Finishing}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Common Area Finishing Activity data available (204)")
@@ -512,8 +613,10 @@ async def Get_Activity():
                 if len(all_common_area_activity_data[-record_limit:]) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Common Area Finishing Activity data: {str(e)}")
+                logger.error(f"Common Area Finishing Activity fetch failed: {str(e)}")
                 break
 
     def safe_select(df, cols):
@@ -549,9 +652,9 @@ async def Get_Activity():
     st.write(common_area_activity_data)
 
     return finishing_activity_data, structure_activity_data, external_activity_data, lift_activity_data, common_area_activity_data
-    
 
 # Fetch Location/Module Data with Async
+@function_timer()
 async def Get_Location():
     record_limit = 1000
     headers = {
@@ -565,6 +668,9 @@ async def Get_Location():
     all_lift_location_data = []
     all_common_area_location_data = []
 
+    # Ensure session is valid before starting
+    await refresh_session_if_needed()
+
     async with aiohttp.ClientSession() as session:
         # Fetch Veridia Finishing Location/Module data
         start_record = 1
@@ -573,6 +679,8 @@ async def Get_Location():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanLocation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_finishing}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Finishing Location data available (204)")
@@ -595,8 +703,10 @@ async def Get_Location():
                 if len(location_data) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Finishing Location data: {str(e)}")
+                logger.error(f"Finishing Location fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia Structure Location/Module data
@@ -606,6 +716,8 @@ async def Get_Location():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanLocation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_structure}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Structure Location data available (204)")
@@ -628,8 +740,10 @@ async def Get_Location():
                 if len(location_data) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Structure Location data: {str(e)}")
+                logger.error(f"Structure Location fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia External Development Location/Module data
@@ -639,6 +753,8 @@ async def Get_Location():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanLocation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_external_development}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more External Development Location data available (204)")
@@ -661,8 +777,10 @@ async def Get_Location():
                 if len(location_data) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching External Development Location data: {str(e)}")
+                logger.error(f"External Development Location fetch failed: {str(e)}")
                 break
 
         # Fetch Veridia Lift Location/Module data
@@ -672,6 +790,8 @@ async def Get_Location():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanLocation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_lift}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 logger.info(f"Fetching Lift Location data from URL: {url}")
                 data = await fetch_data(session, url, headers)
                 if data is None:
@@ -679,13 +799,13 @@ async def Get_Location():
                     break
                 if isinstance(data, list):
                     location_data = [{'qiLocationId': item.get('qiLocationId', ''), 'qiParentId': item.get('qiParentId', ''), 'name': item.get('name', '')} 
-                                for item in data if isinstance(item, dict)]
+                                   for item in data if isinstance(item, dict)]
                     all_lift_location_data.extend(location_data)
                     total_records_fetched = len(all_lift_location_data)
                     st.write(f"Fetched {len(location_data)} Lift Location records (Total: {total_records_fetched})")
                 elif isinstance(data, dict) and 'locationList' in data and data['locationList']:
                     location_data = [{'qiLocationId': loc.get('qiLocationId', ''), 'qiParentId': loc.get('qiParentId', ''), 'name': loc.get('name', '')} 
-                                for loc in data['locationList']]
+                                   for loc in data['locationList']]
                     all_lift_location_data.extend(location_data)
                     total_records_fetched = len(all_lift_location_data)
                     st.write(f"Fetched {len(location_data)} Lift Location records (Total: {total_records_fetched})")
@@ -701,10 +821,6 @@ async def Get_Location():
                 logger.error(f"Lift Location fetch failed: {str(e)}")
                 all_lift_location_data = []  # Fallback to empty list
                 break
-        lift_df = pd.DataFrame(all_lift_location_data)
-        if lift_df.empty:
-            st.warning("No Lift Location data fetched. Proceeding with empty DataFrame.")
-    
 
         # Fetch Veridia Common Area Finishing Location/Module data
         start_record = 1
@@ -713,6 +829,8 @@ async def Get_Location():
         while True:
             url = f"https://adoddleak.asite.com/commonapi/qaplan/getPlanLocation/?projectId={st.session_state.workspaceid}&planId={st.session_state.veridia_Common_Area_Finishing}&recordStart={start_record}&recordLimit={record_limit}"
             try:
+                await refresh_session_if_needed()
+                headers['Cookie'] = f'ASessionID={st.session_state.sessionid}'
                 data = await fetch_data(session, url, headers)
                 if data is None:
                     st.write("No more Common Area Finishing Location data available (204)")
@@ -735,8 +853,10 @@ async def Get_Location():
                 if len(location_data) < record_limit:
                     break
                 start_record += record_limit
+                await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
                 st.error(f"❌ Error fetching Common Area Finishing Location data: {str(e)}")
+                logger.error(f"Common Area Finishing Location fetch failed: {str(e)}")
                 break
 
     finishing_df = pd.DataFrame(all_finishing_location_data)
@@ -780,9 +900,10 @@ async def Get_Location():
     st.session_state.common_area_location_data = common_area_df
 
     return finishing_df, structure_df, external_df, lift_df, common_area_df
-    
+
 
 # Process individual chunk
+@function_timer()
 def process_chunk(chunk, chunk_idx, dataset_name, location_df):
     logger.info(f"Starting thread for {dataset_name} Chunk {chunk_idx + 1}")
     generated_text = format_chunk_locally(chunk, chunk_idx, len(chunk), dataset_name, location_df)
@@ -790,6 +911,7 @@ def process_chunk(chunk, chunk_idx, dataset_name, location_df):
     return generated_text, chunk_idx
 
 # Process data with manual counting
+@function_timer()
 def process_manually(analysis_df, total, dataset_name, chunk_size=1000, max_workers=4):
     if analysis_df.empty:
         st.warning(f"No completed activities found for {dataset_name}.")
@@ -912,6 +1034,7 @@ def process_manually(analysis_df, total, dataset_name, chunk_size=1000, max_work
     return {"towers": aggregated_data, "total": total}
 
 # Local formatting function for manual counting
+@function_timer()
 def format_chunk_locally(chunk, chunk_idx, chunk_size, dataset_name, location_df):
     towers_data = {}
     
@@ -947,6 +1070,7 @@ def format_chunk_locally(chunk, chunk_idx, chunk_size, dataset_name, location_df
     return output
 
 
+@function_timer()
 def process_data(df, activity_df, location_df, dataset_name, use_module_hierarchy_for_finishing=False):
     # Filter completed activities
     completed = df[df['statusName'] == 'Completed'].copy()
@@ -1204,7 +1328,7 @@ def process_data(df, activity_df, location_df, dataset_name, use_module_hierarch
 
 # Main analysis function
 
-
+@function_timer()
 def AnalyzeStatusManually(email=None, password=None):
     start_time = time.time()
 
@@ -1503,6 +1627,7 @@ def AnalyzeStatusManually(email=None, password=None):
     st.write(f"Total execution time: {end_time - start_time:.2f} seconds")
     
 # COS File Fetching Function
+@function_timer()
 def get_cos_files():
     try:
         cos_client = initialize_cos_client()
@@ -1647,7 +1772,7 @@ if 'ignore_year' not in st.session_state:
 
 
 # Process Excel files
-
+@function_timer()
 def process_file(file_stream, filename):
     try:
         workbook = openpyxl.load_workbook(file_stream)
@@ -1721,7 +1846,6 @@ def process_file(file_stream, filename):
 
                 # Ensure critical columns are present
                 if 'Activity Name' not in selected_columns or 'Actual Finish' not in selected_columns:
-                    st.error(f"Critical columns missing in {sheet_name}. Found: {list(selected_columns.keys())}, Required: Activity Name, Actual Finish")
                     logger.error(f"Critical columns missing in {sheet_name}. Found: {selected_columns}")
                     return (None, None), (None, None)
 
@@ -1889,6 +2013,7 @@ def process_file(file_stream, filename):
     
     
 #Slab code
+@function_timer()
 def GetSlabReport():
     foundverdia = False
     today = date.today()
@@ -1918,7 +2043,7 @@ def GetSlabReport():
         for file in files:
             
             try:
-                if file.startswith("Veridia") and "Structure Work Tracker" in file and month_year in file:
+                if file.startswith("Veridia") and "Structure Work Tracker" in file:
                     response = cos_client.get_object(Bucket="projectreportnew", Key=file)
                     
                     if st.session_state.ignore_month and st.session_state.ignore_year:
@@ -1936,7 +2061,7 @@ def GetSlabReport():
         if not foundverdia:
             for file in files:
                 try:
-                    if file.startswith("Veridia") and "Structure Work Tracker" in file and prev_month_year in file:
+                    if file.startswith("Veridia") and "Structure Work Tracker" in file:
                         # st.write("🕓 Previous month:", file)
                         response = cos_client.get_object(Bucket="projectreportnew", Key=file)
                         # st.session_state.slabreport = ProcessVeridia(io.BytesIO(response['Body'].read()))
@@ -1949,38 +2074,17 @@ def GetSlabReport():
                     st.error(e)
                     st.session_state.slabreport = "No Data Found"
                    
-        
     except Exception as e:
         print(f"Error fetching COS files: {e}")
         files = ["Error fetching COS files"]
         st.session_state.slabreport = "No Data Found"
 
+
+@function_timer()
 def generatePrompt(combined_data, slab):
     try:
-        # Display slab data safely and handle different types
         st.write(slab)
-        if isinstance(slab, str):
-            try:
-                slab_data = json.loads(slab)
-                st.write(slab_data)
-                slab_content = slab  # Use the string directly in the prompt
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse slab JSON: {str(e)}")
-                st.warning(f"Failed to parse slab JSON: {str(e)}")
-                return combined_data
-        elif isinstance(slab, dict):
-            st.write(slab)  # Already a dictionary, no need to parse
-            slab_content = json.dumps(slab, indent=2)  # Convert to JSON string for the prompt
-        elif isinstance(slab, pd.DataFrame):
-            # Convert DataFrame to JSON string for display and prompt
-            slab_dict = slab.to_dict(orient='records')
-            st.write(slab_dict)
-            slab_content = json.dumps(slab_dict, indent=2)
-        else:
-            logger.error(f"Unexpected type for slab: {type(slab)}")
-            st.warning(f"Unexpected type for slab: {type(slab)}")
-            return combined_data
-
+        st.write(json.loads(slab))
         cos_df = combined_data["COS"] if isinstance(combined_data["COS"], pd.DataFrame) else pd.DataFrame()
         asite_df = combined_data["Asite"] if isinstance(combined_data["Asite"], pd.DataFrame) else pd.DataFrame()
 
@@ -1993,8 +2097,9 @@ def generatePrompt(combined_data, slab):
 
             The data provided is as follows:
             
+
             Slab:
-            {slab_content}
+            {slab}
 
             COS Table Data:
             {cos_json}
@@ -2004,14 +2109,12 @@ def generatePrompt(combined_data, slab):
 
             Categories and Activities:
             COS:
-            - MEP: EL-First Fix, UP-First Fix, CP-First Fix, Min. count of UP-First Fix and CP-First Fix, C-Gypsum and POP Punning, EL-Second Fix, No. of Slab cast, Electrical
+            - MEP: EL-First Fix, UP-First Fix, CP-First Fix, Min. count of UP-First Fix and CP-First Fix, C-Gypsum and POP Punning, EL-Second Fix, Concreting, Electrical
             - Interior Finishing: Installation of doors, Waterproofing Works, Wall Tiling, Floor Tiling
             - ED Civil: Sewer Line, Storm Line, GSB, WMM, Stamp Concrete, Saucer drain, Kerb Stone
-            - Structure Work: (no activities specified)
             Asite:
-            - MEP: Wall Conducting, Plumbing Works, POP & Gypsum Plaster, Wiring & Switch Socket, Slab Conducting, Electrical Cable
-            - Interior Finishing: Door/Window Frame, Waterproofing - Sunken, Wall Tile, Floor Tile, Door/Window Shutter
-            - Structure Work: Shuttering, Reinforcement
+            - MEP: Wall Conducting, Plumbing Works, POP & Gypsum Plaster, Wiring & Switch Socket, Slab Conducting, Electrical Cable, Concreting
+            - Interior Finishing: Door/Window Frame, Waterproofing - Sunken, Wall Tiling, Floor Tiling, Door/Window Shutter
             - ED Civil: Sewer Line, Rain Water/Storm Line, Granular Sub-base, WMM, Saucer drain/Paver block, Kerb Stone, Concreting
 
             Slab:
@@ -2032,7 +2135,7 @@ def generatePrompt(combined_data, slab):
                         {{"Activity Name": "Min. count of UP-First Fix and CP-First Fix", "Total": 0}},
                         {{"Activity Name": "C-Gypsum and POP Punning", "Total": 0}},
                         {{"Activity Name": "EL-Second Fix", "Total": 0}},
-                        {{"Activity Name": "No. of Slab cast", "Total": 0}},
+                        {{"Activity Name": "Concreting", "Total": 0}},
                         {{"Activity Name": "Electrical", "Total": 0}}
                       ]
                     }},
@@ -2044,10 +2147,6 @@ def generatePrompt(combined_data, slab):
                         {{"Activity Name": "Wall Tiling", "Total": 0}},
                         {{"Activity Name": "Floor Tiling", "Total": 0}}
                       ]
-                    }},
-                    {{
-                      "Category": "Structure Work",
-                      "Activities": []
                     }},
                     {{
                       "Category": "ED Civil",
@@ -2078,7 +2177,8 @@ def generatePrompt(combined_data, slab):
                         {{"Activity Name": "POP & Gypsum Plaster", "Total": 0}},
                         {{"Activity Name": "Wiring & Switch Socket", "Total": 0}},
                         {{"Activity Name": "Slab Conducting", "Total": 0}},
-                        {{"Activity Name": "Electrical Cable", "Total": 0}}
+                        {{"Activity Name": "Electrical Cable", "Total": 0}},
+                        {{"Activity Name": "Concreting", "Total": 0}}
                       ]
                     }},
                     {{
@@ -2086,16 +2186,9 @@ def generatePrompt(combined_data, slab):
                       "Activities": [
                         {{"Activity Name": "Door/Window Frame", "Total": 0}},
                         {{"Activity Name": "Waterproofing - Sunken", "Total": 0}},
-                        {{"Activity Name": "Wall Tile", "Total": 0}},
-                        {{"Activity Name": "Floor Tile", "Total": 0}},
+                        {{"Activity Name": "Wall Tiling", "Total": 0}},
+                        {{"Activity Name": "Floor Tiling", "Total": 0}},
                         {{"Activity Name": "Door/Window Shutter", "Total": 0}}
-                      ]
-                    }},
-                    {{
-                      "Category": "Structure Work",
-                      "Activities": [
-                        {{"Activity Name": "Shuttering", "Total": 0}},
-                        {{"Activity Name": "Reinforcement", "Total": 0}}
                       ]
                     }},
                     {{
@@ -2106,8 +2199,7 @@ def generatePrompt(combined_data, slab):
                         {{"Activity Name": "Granular Sub-base", "Total": 0}},
                         {{"Activity Name": "WMM", "Total": 0}},
                         {{"Activity Name": "Saucer drain/Paver block", "Total": 0}},
-                        {{"Activity Name": "Kerb Stone", "Total": 0}},
-                        {{"Activity Name": "Concreting", "Total": 0}}
+                        {{"Activity Name": "Kerb Stone", "Total": 0}}
                       ]
                     }}
                   ]
@@ -2126,7 +2218,7 @@ def generatePrompt(combined_data, slab):
                 "decoding_method": "greedy",
                 "max_new_tokens": 8100,
                 "min_new_tokens": 0,
-                "stop_sequences": [],  
+                "stop_sequences": [],  # Removed "}" as it can cause truncation issues
                 "repetition_penalty": 1.0,
                 "temperature": 0.1
             },
@@ -2201,6 +2293,7 @@ def generatePrompt(combined_data, slab):
         return (combined_data)
 
 
+@function_timer()
 def extract_and_repair_json(text):
     # Try to find JSON content within the response
     json_match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -2263,6 +2356,7 @@ def extract_and_repair_json(text):
         return None
 
 # Fix the getTotal function to handle the improved JSON structure
+@function_timer()
 def getTotal(ai_data):
     try:
         if isinstance(ai_data, str):
@@ -2320,6 +2414,7 @@ def getTotal(ai_data):
 
    
 # Function to handle activity count display logic
+@function_timer()
 def display_activity_count():
     try:
         if 'ai_response' not in st.session_state or not st.session_state.ai_response:
@@ -2368,7 +2463,7 @@ def display_activity_count():
             "COS": {
                 "MEP": [
                     "EL-First Fix", "UP-First Fix", "CP-First Fix", "Min. count of UP-First Fix and CP-First Fix",
-                    "C-Gypsum and POP Punning", "EL-Second Fix", "No. of Slab cast", "Electrical"
+                    "C-Gypsum and POP Punning", "EL-Second Fix", "Concreting", "Electrical"
                 ],
                 "Interior Finishing": [
                     "Installation of doors", "Waterproofing Works", "Wall Tiling", "Floor Tiling"
@@ -2380,13 +2475,10 @@ def display_activity_count():
             "Asite": {
                 "MEP": [
                     "Wall Conducting", "Plumbing Works", "POP & Gypsum Plaster", "Wiring & Switch Socket",
-                    "Slab Conducting", "Electrical Cable"
+                    "Slab Conducting", "Electrical Cable", "Concreting"
                 ],
                 "Interior Finishing": [
                     "Door/Window Frame", "Waterproofing - Sunken", "Wall Tile", "Floor Tile", "Door/Window Shutter"
-                ],
-                "Structure Work": [
-                    "Shuttering", "Reinforcement"
                 ],
                 "ED Civil": [
                     "Sewer Line", "Rain Water/Storm Line", "Granular Sub-base", "WMM",
@@ -2499,6 +2591,7 @@ st.markdown(
 
 
 # Combined function for Initialize All Data and Fetch COS
+@function_timer()
 async def initialize_and_fetch_data(email, password):
     with st.spinner("Starting initialization and data fetching process..."):
         # Step 1: Login
@@ -2729,15 +2822,37 @@ async def initialize_and_fetch_data(email, password):
         return True
 
 
+
+@function_timer()
 def generate_consolidated_Checklist_excel(ai_data):
     try:
         # Parse AI data if it's a string
         if isinstance(ai_data, str):
+            logger.info("Parsing ai_data from string")
             ai_data = json.loads(ai_data)
         
         if not isinstance(ai_data, dict) or "COS" not in ai_data or "Asite" not in ai_data:
+            logger.error("Invalid AI data format: missing 'COS' or 'Asite' keys")
             st.error("❌ Invalid AI data format for Excel generation.")
             return None
+
+        logger.info(f"AI data keys: {list(ai_data.keys())}")
+        logger.info(f"COS data: {ai_data.get('COS', [])}")
+        logger.info(f"Asite data: {ai_data.get('Asite', [])}")
+
+        # Normalize slab_data structure
+        if isinstance(ai_data, dict):
+            if "Slab" in ai_data:
+                slab_counts = ai_data["Slab"]
+                logger.info("Slab data found with 'Slab' key.")
+            else:
+                slab_counts = ai_data
+                logger.info("Slab data provided directly without 'Slab' key.")
+        else:
+            logger.warning("Invalid slab data format. Expected a dictionary. Proceeding without slab data.")
+            slab_counts = {}
+        
+        logger.info(f"Slab counts: {slab_counts}")
 
         # Define the COS to Asite activity name mapping
         cos_to_asite_mapping = {
@@ -2749,7 +2864,6 @@ def generate_consolidated_Checklist_excel(ai_data):
             "Wall Tile": "Wall Tile",
             "Floor Tile": "Floor Tile",
             "EL-Second Fix": "Wiring & Switch Socket",
-            "No. of Slab cast": "No. of Slab cast",
             "Sewer Line": "Sewer Line",
             "Line Storm Line": "Rain Water/Storm",
             "GSB": "Granular Sub-base",
@@ -2757,46 +2871,42 @@ def generate_consolidated_Checklist_excel(ai_data):
             "Saucer drain": "Saucer drain/Paver block",
             "Kerb Stone": "Kerb Stone",
             "Electrical": "Electrical Cable",
-            "Stamp Concrete": "Concreting"
+            "Concreting": "Concreting"
         }
 
-        # Activities that map to "No. of Slab cast" in Asite
-        slab_cast_activities = ["Shuttering", "Reinforcement", "Slab conducting", "Concreting"]
+        # Activities that map to "Concreting" in Asite
+        slab_cast_activities = ["Shuttering", "Reinforcement", "Concreting"]  
 
         # Initialize lists to store data
         consolidated_rows = []
 
-        # Process Slab data if present in AI output
+        # Process Slab data
         slab_data_dict = {}
-        if "Slab" in ai_data:
-            slab_data = ai_data["Slab"]
-            for tower_name, total_count in slab_data.items():
-                if tower_name != "Tower Name" and tower_name != "Total":  # Skip header and total rows
-                    original_tower_name = tower_name  # Keep original for debugging
+        for tower_name, total_count in slab_counts.items():
+            if tower_name != "Tower Name" and tower_name != "Total":  # Skip header and total rows
+                original_tower_name = tower_name  # Keep original for debugging
+                
+                # Normalize tower name but preserve A/B suffixes
+                if "Tower" in tower_name:
+                    tower_name = tower_name.replace("Tower ", "T").replace("(", "").replace(")", "")
+                
+                logger.info(f"Processing Slab Tower: {original_tower_name} -> {tower_name}")
+                
+                count = int(total_count) if pd.notna(total_count) else 0
+                
+                # Special handling for Tower 4 - split slab data between T4A and T4B
+                if tower_name == "T4":
+                    half_count = count // 2
+                    remainder = count % 2
                     
-                    # Normalize tower name but preserve A/B suffixes
-                    if "Tower" in tower_name:
-                        tower_name = tower_name.replace("Tower ", "T").replace("(", "").replace(")", "")
-                        # Handle special cases like "Tower 4A" -> "T4A", "Tower 4B" -> "T4B"
-                        # This preserves the A/B distinction
+                    slab_data_dict["T4A"] = half_count + remainder
+                    slab_data_dict["T4B"] = half_count
                     
-                    logger.info(f"Processing Slab Tower: {original_tower_name} -> {tower_name}")
-                    
-                    count = int(total_count) if pd.notna(total_count) else 0
-                    
-                    # Special handling for Tower 4 - split slab data between T4A and T4B
-                    if tower_name == "T4":
-                        # Split the count between T4A and T4B (assuming equal distribution)
-                        half_count = count // 2
-                        remainder = count % 2
-                        
-                        slab_data_dict["T4A"] = half_count + remainder
-                        slab_data_dict["T4B"] = half_count
-                        
-                        logger.info(f"Split T4 Slab data: T4A={half_count + remainder}, T4B={half_count}")
-                    else:
-                        # Store slab conducting data - we'll determine category later from existing data
-                        slab_data_dict[tower_name] = count
+                    logger.info(f"Split T4 Slab data: T4A={half_count + remainder}, T4B={half_count}")
+                else:
+                    slab_data_dict[tower_name] = count
+
+        logger.info(f"Processed slab_data_dict: {slab_data_dict}")
 
         # Process COS data
         cos_data_dict = {}
@@ -2804,11 +2914,8 @@ def generate_consolidated_Checklist_excel(ai_data):
             tower_name = tower_data.get("Tower", "Unknown Tower")
             original_tower_name = tower_name  # Keep original for debugging
             
-            # Normalize tower name but preserve A/B suffixes
             if "Tower" in tower_name:
                 tower_name = tower_name.replace("Tower ", "T").replace("(", "").replace(")", "")
-                # Handle special cases like "Tower 4A" -> "T4A", "Tower 4B" -> "T4B"
-                # This preserves the A/B distinction
             
             logger.info(f"Processing COS Tower: {original_tower_name} -> {tower_name}")
             
@@ -2825,19 +2932,15 @@ def generate_consolidated_Checklist_excel(ai_data):
                 for activity in category_data.get("Activities", []):
                     activity_name = activity.get("Activity Name", "Unknown Activity")
                     count = int(activity.get("Total", 0)) if pd.notna(activity.get("Total")) else 0
-                    open_missing = activity.get("OpenMissingOverride", None)  # Check for override
+                    open_missing = activity.get("OpenMissingOverride", None)
                     
-                    # Special handling for Tower 4 - split data between T4A and T4B
                     if tower_name == "T4":
-                        # Split the count between T4A and T4B (assuming equal distribution)
                         half_count = count // 2
                         remainder = count % 2
                         
-                        # Add to T4A
                         key_4a = ("T4A", activity_name, category)
                         cos_data_dict[key_4a] = {"count": half_count + remainder, "open_missing": open_missing}
                         
-                        # Add to T4B
                         key_4b = ("T4B", activity_name, category)
                         cos_data_dict[key_4b] = {"count": half_count, "open_missing": open_missing}
                         
@@ -2846,17 +2949,16 @@ def generate_consolidated_Checklist_excel(ai_data):
                         key = (tower_name, activity_name, category)
                         cos_data_dict[key] = {"count": count, "open_missing": open_missing}
 
+        logger.info(f"COS data dict: {cos_data_dict}")
+
         # Process Asite data
         asite_data_dict = {}
         for tower_data in ai_data.get("Asite", []):
             tower_name = tower_data.get("Tower", "Unknown Tower")
             original_tower_name = tower_name  # Keep original for debugging
             
-            # Normalize tower name but preserve A/B suffixes
             if "Tower" in tower_name:
                 tower_name = tower_name.replace("Tower ", "T").replace("(", "").replace(")", "")
-                # Handle special cases like "Tower 4A" -> "T4A", "Tower 4B" -> "T4B"
-                # This preserves the A/B distinction
             
             logger.info(f"Processing Asite Tower: {original_tower_name} -> {tower_name}")
             
@@ -2873,19 +2975,15 @@ def generate_consolidated_Checklist_excel(ai_data):
                 for activity in category_data.get("Activities", []):
                     activity_name = activity.get("Activity Name", "Unknown Activity")
                     count = int(activity.get("Total", 0)) if pd.notna(activity.get("Total")) else 0
-                    open_missing = activity.get("OpenMissingOverride", None)  # Check for override
+                    open_missing = activity.get("OpenMissingOverride", None)
                     
-                    # Special handling for Tower 4 - split data between T4A and T4B
                     if tower_name == "T4":
-                        # Split the count between T4A and T4B (assuming equal distribution)
                         half_count = count // 2
                         remainder = count % 2
                         
-                        # Add to T4A
                         key_4a = ("T4A", activity_name, category)
                         asite_data_dict[key_4a] = {"count": half_count + remainder, "open_missing": open_missing}
                         
-                        # Add to T4B
                         key_4b = ("T4B", activity_name, category)
                         asite_data_dict[key_4b] = {"count": half_count, "open_missing": open_missing}
                         
@@ -2894,19 +2992,24 @@ def generate_consolidated_Checklist_excel(ai_data):
                         key = (tower_name, activity_name, category)
                         asite_data_dict[key] = {"count": count, "open_missing": open_missing}
 
+        logger.info(f"Asite data dict: {asite_data_dict}")
+
         # Normalize COS data to use Asite activity names
         normalized_cos_data = {}
         for (tower, cos_activity, category), data in cos_data_dict.items():
             count = data["count"]
             open_missing = data["open_missing"]
-            if cos_activity in slab_cast_activities:
-                asite_activity = "No. of Slab cast"
+            
+            # Map slab-related activities to "Concreting"
+            if cos_activity in slab_cast_activities or cos_activity == "Slab Conducting":
+                asite_activity = "Concreting"
                 key = (tower, asite_activity, category)
                 existing_data = normalized_cos_data.get(key, {"count": 0, "open_missing": None})
                 normalized_cos_data[key] = {
                     "count": existing_data["count"] + count,
                     "open_missing": open_missing if open_missing is not None else existing_data["open_missing"]
                 }
+                logger.info(f"Mapped {cos_activity} to Concreting for {tower} in {category}")
             elif cos_activity in ["UP-First Fix", "CP-First Fix"]:
                 asite_activity = "Plumbing Works"
                 key = (tower, asite_activity, category)
@@ -2928,67 +3031,106 @@ def generate_consolidated_Checklist_excel(ai_data):
                 key = (tower, cos_activity, category)
                 normalized_cos_data[key] = {"count": count, "open_missing": open_missing}
 
-        # Merge slab data with normalized COS data
-        # Find existing "Slab Conducting" entries and update them with slab data
-        for key in list(normalized_cos_data.keys()):
-            tower, activity, category = key
-            if activity == "Slab Conducting" and tower in slab_data_dict:
-                # Update the completed work count with slab data
-                normalized_cos_data[key]["count"] = slab_data_dict[tower]
-                logger.info(f"Updated Slab Conducting for {tower} with slab data: {slab_data_dict[tower]}")
+        logger.info(f"Normalized COS data before slab merge: {normalized_cos_data}")
+
+        # **CRITICAL UPDATE**: Merge slab data with normalized COS data for "Concreting" activities
+        # This ensures slab_data_dict counts are properly mapped to "Concreting" in Completed Work column
         
-        # If there are slab data entries that don't have corresponding COS/Asite entries, 
-        # we need to find where "Slab Conducting" exists in Asite data to determine the correct category
+        # First, identify all categories that have "Concreting" activities from Asite data
+        concreting_categories = {}
+        for (tower, activity, category) in asite_data_dict.keys():
+            if activity == "Concreting":
+                if tower not in concreting_categories:
+                    concreting_categories[tower] = []
+                if category not in concreting_categories[tower]:
+                    concreting_categories[tower].append(category)
+        
+        logger.info(f"Found Concreting categories: {concreting_categories}")
+        
+        # Update/Create Concreting entries with slab data for each tower and relevant category
         for tower_name, slab_count in slab_data_dict.items():
-            # Look for existing "Slab Conducting" in any category for this tower
-            existing_key = None
-            for key in asite_data_dict.keys():
-                tower, activity, category = key
-                if tower == tower_name and activity == "Slab Conducting":
-                    existing_key = key
-                    break
+            # Get categories for this tower, default to common categories if not found
+            categories = concreting_categories.get(tower_name, ["MEP Works", "Structure Works"])
             
-            # If found in Asite data but not in normalized COS data, add it
-            if existing_key and existing_key not in normalized_cos_data:
-                normalized_cos_data[existing_key] = {"count": slab_count, "open_missing": None}
-                logger.info(f"Added new Slab Conducting entry for {tower_name} with slab data: {slab_count}")
-            # If not found anywhere, add it to Structure Works as default
-            elif not existing_key:
-                new_key = (tower_name, "Slab Conducting", "Structure Works")
-                if new_key not in normalized_cos_data:
-                    normalized_cos_data[new_key] = {"count": slab_count, "open_missing": None}
-                    logger.info(f"Created new Slab Conducting entry for {tower_name} in Structure Works: {slab_count}")
+            for category in categories:
+                key = (tower_name, "Concreting", category)
+                
+                # FORCE UPDATE: Set the slab count as the completed work count for Concreting
+                # This will override any existing count for Concreting with the actual slab count
+                normalized_cos_data[key] = {
+                    "count": slab_count,  # This will show in "Completed Work*(Count of Flat)" column
+                    "open_missing": normalized_cos_data.get(key, {}).get("open_missing", None)
+                }
+                logger.info(f"UPDATED: Set Concreting for {tower_name} in {category} with slab count: {slab_count}")
+
+        # Also ensure any tower in slab_data_dict that doesn't have existing Concreting entries gets them
+        for tower_name, slab_count in slab_data_dict.items():
+            # Check if this tower has any Concreting entries
+            has_concreting = any(key[0] == tower_name and key[1] == "Concreting" for key in normalized_cos_data.keys())
+            
+            if not has_concreting:
+                # Create Concreting entry with default category
+                default_category = "Structure Works"  # or determine based on your business logic
+                key = (tower_name, "Concreting", default_category)
+                normalized_cos_data[key] = {
+                    "count": slab_count,
+                    "open_missing": None
+                }
+                logger.info(f"CREATED: New Concreting entry for {tower_name} in {default_category} with slab count: {slab_count}")
+
+        logger.info(f"After merging slab data, normalized COS data: {normalized_cos_data}")
 
         # Combine normalized COS (including slab) and Asite data
         all_keys = set(normalized_cos_data.keys()).union(set(asite_data_dict.keys()))
         for key in all_keys:
             tower_name, activity_name, category = key
+            # Skip "No. of Slab cast" to avoid displaying it (since we're now using "Concreting")
+            if activity_name == "No. of Slab cast":
+                continue
+                
             cos_data = normalized_cos_data.get(key, {"count": 0, "open_missing": None})
             asite_data = asite_data_dict.get(key, {"count": 0, "open_missing": None})
             cos_count = cos_data["count"]
             asite_count = asite_data["count"]
             
-            # Use override if provided, otherwise calculate absolute difference
+            # Special logging for Concreting activities to debug
+            if activity_name == "Concreting":
+                logger.info(f"CONCRETING DEBUG - Tower: {tower_name}, Category: {category}, COS Count: {cos_count}, Asite Count: {asite_count}")
+            
             open_missing_override = cos_data["open_missing"] if cos_data["open_missing"] is not None else asite_data["open_missing"]
             if open_missing_override is not None:
                 open_missing_count = open_missing_override
             else:
-                open_missing_count = abs(cos_count - asite_count)  # Absolute difference for positive values
-            
+                open_missing_count = abs(cos_count - asite_count)
+            in_progress_count = 0
             consolidated_rows.append({
                 "Tower": tower_name,
                 "Category": category,
                 "Activity Name": activity_name,
-                "Completed Work*(Count of Flat)": cos_count,
+                "Completed Work*(Count of Flat)": cos_count, 
+                "In Progress Work*(Count of Flat)":in_progress_count,
                 "Closed checklist against completed work": asite_count,
                 "Open/Missing check list": open_missing_count
             })
 
+        logger.info(f"Consolidated rows: {consolidated_rows}")
+
         # Create DataFrame
         df = pd.DataFrame(consolidated_rows)
         if df.empty:
+            logger.warning("DataFrame is empty after processing. No data available to generate consolidated checklist.")
             st.warning("No data available to generate consolidated checklist.")
-            return None
+            # Create a minimal Excel file with a message
+            output = BytesIO()
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Consolidated Checklist"
+            worksheet.cell(row=1, column=1).value = "No data available to generate consolidated checklist."
+            workbook.save(output)
+            output.seek(0)
+            return output
+
+        logger.info(f"DataFrame created with {len(df)} rows")
 
         # Sort by Tower, Category, and Activity Name for consistency
         df.sort_values(by=["Tower", "Category", "Activity Name"], inplace=True)
@@ -3010,38 +3152,33 @@ def generate_consolidated_Checklist_excel(ai_data):
         )
         center_alignment = Alignment(horizontal='center')
 
-        # Create the consolidated sheet
-        worksheet = workbook.create_sheet(title="Consolidated Checklist")
+        # Create Sheet 1: Consolidated Checklist
+        worksheet1 = workbook.create_sheet(title="Consolidated Checklist")
         current_row = 1
 
-        # Group by Tower
         grouped_by_tower = df.groupby('Tower')
 
         for tower, tower_group in grouped_by_tower:
-            # Write Tower name in column F
-            worksheet.cell(row=current_row, column=6).value = tower
-            worksheet.cell(row=current_row, column=6).font = header_font
+            worksheet1.cell(row=current_row, column=6).value = tower
+            worksheet1.cell(row=current_row, column=6).font = header_font
             current_row += 1
 
-            # Group Categories within this Tower
             grouped_by_category = tower_group.groupby('Category')
 
-            # Process each Category vertically
             for category, cat_group in grouped_by_category:
-                # Write section header
-                worksheet.cell(row=current_row, column=6).value = f"{tower} May Checklist Status - {category}"
-                worksheet.cell(row=current_row, column=6).font = category_font
+                worksheet1.cell(row=current_row, column=6).value = f"{tower} June Checklist Status - {category}"
+                worksheet1.cell(row=current_row, column=6).font = category_font
                 current_row += 1
 
-                # Write table headers
                 headers = [
                     "ACTIVITY NAME",
                     "Completed Work*(Count of Flat)",
+                    "In Progress Work*(Count of Flat)",
                     "Closed checklist against completed work",
                     "Open/Missing check list"
                 ]
-                for col, header in enumerate(headers, start=6):  # Start at column F (6)
-                    cell = worksheet.cell(row=current_row, column=col)
+                for col, header in enumerate(headers, start=6):
+                    cell = worksheet1.cell(row=current_row, column=col)
                     cell.value = header
                     cell.font = header_font
                     cell.border = border
@@ -3049,33 +3186,32 @@ def generate_consolidated_Checklist_excel(ai_data):
 
                 current_row += 1
 
-                # Write activity data
                 for _, row in cat_group.iterrows():
-                    worksheet.cell(row=current_row, column=6).value = row["Activity Name"]
-                    worksheet.cell(row=current_row, column=7).value = row["Completed Work*(Count of Flat)"]
-                    worksheet.cell(row=current_row, column=8).value = row["Closed checklist against completed work"]
-                    worksheet.cell(row=current_row, column=9).value = row["Open/Missing check list"]
-                    for col in range(6, 10):  # Columns F to I
-                        cell = worksheet.cell(row=current_row, column=col)
+                    worksheet1.cell(row=current_row, column=6).value = row["Activity Name"]
+                    worksheet1.cell(row=current_row, column=7).value = row["Completed Work*(Count of Flat)"]
+                    worksheet1.cell(row=current_row, column=8).value = row["In Progress Work*(Count of Flat)"]
+                    worksheet1.cell(row=current_row, column=9).value = row["Closed checklist against completed work"]
+                    worksheet1.cell(row=current_row, column=10).value = row["Open/Missing check list"]
+                    for col in range(6, 10):
+                        cell = worksheet1.cell(row=current_row, column=col)
                         cell.border = border
                         cell.alignment = center_alignment
                     current_row += 1
 
-                # Write total pending checklist
                 total_open_missing = cat_group["Open/Missing check list"].sum()
-                worksheet.cell(row=current_row, column=6).value = "TOTAL pending checklist MAY"
-                worksheet.cell(row=current_row, column=9).value = total_open_missing
-                for col in range(6, 10):  # Columns F to I
-                    cell = worksheet.cell(row=current_row, column=col)
+                worksheet1.cell(row=current_row, column=6).value = "TOTAL pending checklist June"
+                worksheet1.cell(row=current_row, column=9).value = total_open_missing
+                for col in range(6, 10):
+                    cell = worksheet1.cell(row=current_row, column=col)
                     cell.font = category_font
                     cell.border = border
                     cell.alignment = center_alignment
                 current_row += 1
 
-            current_row += 1  # Add a blank row between Tower sections
+            current_row += 1
 
-        # Adjust column widths
-        for col in worksheet.columns:
+        # Adjust column widths for Sheet 1
+        for col in worksheet1.columns:
             max_length = 0
             column = col[0].column_letter
             for cell in col:
@@ -3085,23 +3221,112 @@ def generate_consolidated_Checklist_excel(ai_data):
                 except:
                     pass
             adjusted_width = (max_length + 2)
-            worksheet.column_dimensions[column].width = adjusted_width
+            worksheet1.column_dimensions[column].width = adjusted_width
+
+        # Create Sheet 2: Summary Checklist
+        worksheet2 = workbook.create_sheet(title="Checklist June")
+        current_row = 1
+
+        # Write title
+        worksheet2.cell(row=current_row, column=1).value = "Checklist: June"
+        worksheet2.cell(row=current_row, column=1).font = header_font
+        current_row += 1
+
+        # Write headers
+        headers = [
+            "Site",
+            "Total of Missing & Open Checklist-Civil",
+            "Total of Missing & Open Checklist-MEP",
+            "TOTAL"
+        ]
+        for col, header in enumerate(headers, start=1):
+            cell = worksheet2.cell(row=current_row, column=col)
+            cell.value = header
+            cell.font = header_font
+            cell.border = border
+            cell.alignment = center_alignment
+        current_row += 1
+
+        # Categorize towers into Civil and MEP
+        def map_category_to_type(category):
+            if category in ["Civil Works", "Structure Works"]:
+                return "Civil"
+            elif category in ["MEP Works", "Interior Finishing Works"]:
+                return "MEP"
+            elif category == "External Development":
+                return "Civil"  # Assuming External Development is Civil
+            else:
+                return "Civil"  # Default to Civil if unknown
+
+        # Aggregate open/missing counts by tower and type (Civil/MEP)
+        summary_data = {}
+        for _, row in df.iterrows():
+            tower = row["Tower"]
+            category = row["Category"]
+            open_missing = row["Open/Missing check list"]
+            
+            # Convert tower name to display format (e.g., "T4A" -> "Veridia-Tower 04 A")
+            if "External Development" in category:
+                site_name = f"External Development-{tower}"
+            else:
+                tower_num = tower[1:]  # Remove 'T' prefix
+                if len(tower_num) == 1:
+                    tower_num = f"0{tower_num}"  # Pad single digits (e.g., "T2" -> "02")
+                site_name = f"Veridia-Tower {tower_num}"
+
+            type_ = map_category_to_type(category)
+            
+            if site_name not in summary_data:
+                summary_data[site_name] = {"Civil": 0, "MEP": 0}
+            
+            summary_data[site_name][type_] += open_missing
+
+        logger.info(f"Summary data for Sheet 2: {summary_data}")
+
+        # Write summary data to Sheet 2
+        for site_name, counts in sorted(summary_data.items()):
+            civil_count = counts["Civil"]
+            mep_count = counts["MEP"]
+            total_count = civil_count + mep_count
+            
+            worksheet2.cell(row=current_row, column=1).value = site_name
+            worksheet2.cell(row=current_row, column=2).value = civil_count
+            worksheet2.cell(row=current_row, column=3).value = mep_count
+            worksheet2.cell(row=current_row, column=4).value = total_count
+            
+            for col in range(1, 5):
+                cell = worksheet2.cell(row=current_row, column=col)
+                cell.border = border
+                cell.alignment = center_alignment
+            current_row += 1
+
+        # Adjust column widths for Sheet 2
+        for col in worksheet2.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            worksheet2.column_dimensions[column].width = adjusted_width
 
         # Save the workbook to the BytesIO buffer
         workbook.save(output)
         output.seek(0)
 
+        logger.info("Excel file generated successfully")
         return output
 
     except Exception as e:
-        logger.error(f"Error generating consolidated Excel: {str(e)}")
+        logger.error(f"Error generating consolidated Excel: {str(e)}", exc_info=True)
         st.error(f"❌ Error generating Excel file: {str(e)}")
         return None
 
-
-
 # Streamlit UI - Modified Button Code
-st.sidebar.title("🔒 Asite Initialization")
+st.sidebar.title("🔒Asite Initialization")
 email = st.sidebar.text_input("Email", "impwatson@gadieltechnologies.com", key="email_input")
 password = st.sidebar.text_input("Password", "Srihari@790$", type="password", key="password_input")
 
@@ -3119,9 +3344,8 @@ if st.sidebar.button("Initialize and Fetch Data"):
     finally:
         loop.close()
 
-
-
 # Combined function to handle both analysis and activity count display
+@function_timer(show_args=True)
 def run_analysis_and_display():
     try:
         st.write("Running status analysis...")
@@ -3138,9 +3362,18 @@ def run_analysis_and_display():
         st.success("Activity counts displayed successfully!")
 
         st.write("Generating consolidated checklist Excel file...")
+        # Defensive initialization for ai_response
         if 'ai_response' not in st.session_state or not st.session_state.ai_response:
-            st.error("❌ No AI data available to generate Excel. Please ensure analysis ran successfully.")
-            return
+            st.session_state.ai_response = {"COS": [], "Asite": []}
+            st.warning("AI response not found. Initialized to empty data.")
+
+        # Ensure GetSlabReport is called to populate slabreport
+        GetSlabReport()
+
+        # Defensive initialization for slabreport
+        if 'slabreport' not in st.session_state:
+            st.session_state.slabreport = {}
+            st.warning("Slab report data not found. Initialized to empty dictionary.")
 
         with st.spinner("Generating Excel file... This may take a moment."):
             excel_file = generate_consolidated_Checklist_excel(st.session_state.ai_response)
@@ -3167,7 +3400,6 @@ def run_analysis_and_display():
         st.error(f"Error during analysis, display, or Excel generation: {str(e)}")
         logging.error(f"Error during analysis, display, or Excel generation: {str(e)}")
 
-
 st.sidebar.title("📊 Status Analysis")
 
 if st.sidebar.button("Analyze and Display Activity Counts"):
@@ -3176,30 +3408,4 @@ if st.sidebar.button("Analyze and Display Activity Counts"):
 st.sidebar.title("📊 Slab Cycle")
 st.session_state.ignore_year = st.sidebar.number_input("Ignore Year", min_value=1900, max_value=2100, value=2023, step=1, key="ignore_year1")
 st.session_state.ignore_month = st.sidebar.number_input("Ignore Month", min_value=1, max_value=12, value=3, step=1, key="ignore_month1")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
